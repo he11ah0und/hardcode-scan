@@ -1,5 +1,6 @@
-// hardcode-scan is a ratchet guard against hardcoded Cyrillic/CJK text in
-// Go and TS/TSX sources. See README.md for usage.
+// hardcode-scan is a ratchet guard against hardcoded non-ASCII (and,
+// opt-in, English) UI text in Go, TS/TSX and Svelte sources. See
+// README.md for usage.
 package main
 
 import (
@@ -29,18 +30,22 @@ func (d *dirList) Set(v string) error {
 
 func main() {
 	var (
-		root   = flag.String("root", ".", "project root; key paths are relative to it")
-		allow  = flag.String("allow", ".hardcode-scan.allow", "allowlist file path")
-		goDirs dirList
-		tsDirs dirList
-		update = flag.Bool("update", false, "overwrite the allowlist with the current scan")
-		quiet  = flag.Bool("quiet", false, "suppress the OK message on success")
+		root       = flag.String("root", ".", "project root; key paths are relative to it")
+		allow      = flag.String("allow", ".hardcode-scan.allow", "allowlist file path")
+		goDirs     dirList
+		tsDirs     dirList
+		svelteDirs dirList
+		latinDirs  dirList
+		update     = flag.Bool("update", false, "overwrite the allowlist with the current scan")
+		quiet      = flag.Bool("quiet", false, "suppress the OK message on success")
 	)
 	flag.Var(&goDirs, "go", "directories to scan for Go sources (repeatable, comma-separated; relative to root)")
 	flag.Var(&tsDirs, "ts", "directories to scan for TS/TSX sources (repeatable, comma-separated; relative to root)")
+	flag.Var(&svelteDirs, "svelte", "directories to scan for Svelte sources (repeatable, comma-separated; relative to root)")
+	flag.Var(&latinDirs, "latin", "directories where ASCII English UI text is also flagged (repeatable, comma-separated; \".\" = everywhere)")
 	flag.Parse()
 
-	keys, err := scan.Scan(*root, goDirs, tsDirs)
+	keys, err := scan.Scan(*root, goDirs, tsDirs, svelteDirs, latinDirs)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "hardcode-scan: scan failed: %v\n", err)
 		os.Exit(2)
@@ -64,7 +69,7 @@ func main() {
 	newKeys, stale := ratchet.Compare(keys, allowSet)
 	failed := false
 	if len(newKeys) > 0 {
-		fmt.Println("New hardcoded Cyrillic/CJK strings — move user-facing texts to i18n resources:")
+		fmt.Println("New hardcoded non-ASCII strings — move user-facing texts to i18n resources:")
 		for _, k := range newKeys {
 			fmt.Println(k)
 		}
