@@ -105,11 +105,50 @@ func TestSvelteUnionTypeInScript(t *testing.T) {
 	}
 }
 
+func TestSvelteMultilineExpression(t *testing.T) {
+	root := t.TempDir()
+	// Multi-line {...} expression: continuation lines must not be treated
+	// as text nodes (latin FP), and strings inside must still flag.
+	writeFile(t, root, "src/App.svelte", "{cond\n  ? tValue($locale, 'a.b')\n  : tValue($locale, 'c.d')}\n")
+	if keys := scanDir(t, root, nil, nil, []string{"src"}, []string{"src"}); len(keys) != 0 {
+		t.Fatalf("multi-line expression with keys must not flag, got %v", keys)
+	}
+	writeFile(t, root, "src/B.svelte", "{cond\n  ? 'Да'\n  : 'Нет'}\n")
+	keys := scanDir(t, root, nil, nil, []string{"src"}, nil)
+	if len(keys) != 2 {
+		t.Fatalf("multi-line expression strings must flag both lines, got %v", keys)
+	}
+}
+
+func TestSvelteScriptTemplateInterpolation(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "src/App.svelte", "<script>\n  const s = `${formatSpeed(x)} ms`;\n</script>\n")
+	if keys := scanDir(t, root, nil, nil, []string{"src"}, []string{"src"}); len(keys) != 0 {
+		t.Fatalf("interpolation code in script must not flag, got %v", keys)
+	}
+}
+
 func TestSvelteMultilineTemplateAttr(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "src/App.svelte", "<input\n  placeholder=\"Введите\n  имя\">\n")
 	keys := scanDir(t, root, nil, nil, []string{"src"}, nil)
 	if len(keys) != 2 {
 		t.Fatalf("multi-line attribute value must flag both lines, got %v", keys)
+	}
+}
+
+func TestSvelteTemplateLiteralInterpolationInExpression(t *testing.T) {
+	root := t.TempDir()
+	// Regression: runes were fed to the expression lexer one at a time
+	// without lookahead, so ${ was never recognised and interpolation
+	// code accumulated as template text, tripping the latin heuristic.
+	writeFile(t, root, "src/App.svelte", "{@render Row(tValue($locale, 'a.b'), `${formatSpeed(c.down)} (${formatBytes(c.total)})`)}\n")
+	if keys := scanDir(t, root, nil, nil, []string{"src"}, []string{"src"}); len(keys) != 0 {
+		t.Fatalf("interpolation code in template expression must not flag, got %v", keys)
+	}
+	// Text between interpolations is still real UI text and must flag.
+	writeFile(t, root, "src/B.svelte", "{x(`${a} per page ${b}`)}\n")
+	if keys := scanDir(t, root, nil, nil, []string{"src"}, []string{"src"}); len(keys) != 1 {
+		t.Fatalf("text between interpolations must flag, got %v", keys)
 	}
 }

@@ -23,14 +23,14 @@ import (
 //
 // Deliberate simplifications: <script>/<style> are recognised anywhere on
 // a line, but </script> inside a script string would end the zone early;
-// template literals inside {...} expressions are treated like plain
-// strings (no ${} nesting); {...} expressions never span lines.
+// '...' and "..." strings never span lines.
 func scanSvelteFile(root, path string, keys map[string]struct{}, latin bool) error {
 	src, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	st := svelteState{zone: zoneTemplate}
+	st.ts.lex.latin = latin
 	for _, line := range splitLines(src) {
 		if st.lineHasDetect(line, latin) {
 			key, err := relKey(root, path, line)
@@ -68,6 +68,7 @@ type svelteState struct {
 	attrName    []rune
 	attrVal     []rune
 	nameBuf     []rune
+	expr        *exprScanner // active {...} expression (may span lines)
 	ts          tsState
 }
 
@@ -80,15 +81,16 @@ func (st *svelteState) lineHasDetect(line string, latin bool) bool {
 		switch st.zone {
 		case zoneScript:
 			if idx := strings.Index(rest, "</script>"); idx >= 0 {
-				if st.ts.lineHasDetect(rest[:idx], latin) {
+				if st.ts.lineHasDetect(rest[:idx]) {
 					found = true
 				}
 				st.ts = tsState{}
+				st.ts.lex.latin = latin
 				st.zone = zoneTemplate
 				rest = rest[idx+len("</script>"):]
 				continue
 			}
-			if st.ts.lineHasDetect(rest, latin) {
+			if st.ts.lineHasDetect(rest) {
 				found = true
 			}
 			return found
@@ -110,55 +112,67 @@ func (st *svelteState) lineHasDetect(line string, latin bool) bool {
 	return found
 }
 
-// exprScanner consumes a {...} expression rune by rune. Quoted strings
+// exprScanner consumes a {...} expression rune by rune using the shared
+// frame-stack lexer primed inside an interpolation frame. Quoted strings
 // inside are collected per literal and checked for detected runes and (in
 // latin mode) the English UI-text heuristic; detected runes anywhere else
-// in the expression flag as well.
+// in the expression flag as well. Expressions may span lines.
+//
+// Runes are fed with one rune of delay so the lexer always sees the
+// lookahead it needs for two-char tokens (${, /*, */, //). The closing
+// '}' of the outermost brace is fed immediately with next=0 — it never
+// takes part in a two-char token, and delaying it would leave the
+// expression open forever.
 type exprScanner struct {
-	depth   int
-	quote   rune
-	escaped bool
-	seg     []rune
-	found   bool
+	lex     textLexer
+	pending rune
+	hasPend bool
+	comment bool // a // comment swallows the rest of the current line
 }
 
-// step feeds one rune; done reports that the closing '}' of the outermost
-// brace was consumed.
-func (e *exprScanner) step(r rune, latin bool) (done bool) {
-	switch {
-	case e.quote != 0:
-		switch {
-		case e.escaped:
-			e.escaped = false
-		case r == '\\':
-			e.escaped = true
-		case r == e.quote:
-			e.quote = 0
-			if latin && looksLikeUIText(string(e.seg)) {
-				e.found = true
-			}
-			e.seg = e.seg[:0]
-		default:
-			e.seg = append(e.seg, r)
-			if IsDetectRune(r) {
-				e.found = true
-			}
+func newExprScanner(latin bool) *exprScanner {
+	e := &exprScanner{}
+	e.lex.latin = latin
+	e.lex.frames = []lexFrame{{kind: frameInterp, depth: 1}}
+	return e
+}
+
+// step feeds one rune; done reports that the closing '}' of the
+// outermost brace was consumed.
+func (e *exprScanner) step(r rune) (done bool) {
+	if e.comment {
+		return false
+	}
+	if e.hasPend {
+		e.hasPend = false
+		stop, skip := e.lex.feedRune(e.pending, r)
+		if stop {
+			e.comment = true
+			return false
 		}
-	case r == '\'' || r == '"' || r == '`':
-		e.quote = r
-	case r == '{':
-		e.depth++
-	case r == '}':
-		e.depth--
-		if e.depth == 0 {
+		if len(e.lex.frames) == 0 {
 			return true
 		}
-	default:
-		if IsDetectRune(r) {
-			e.found = true
+		if skip {
+			return false // r was consumed with pending
 		}
 	}
+	if r == '}' && len(e.lex.frames) == 1 &&
+		e.lex.frames[0].kind == frameInterp && e.lex.frames[0].depth == 1 {
+		e.lex.feedRune(r, 0)
+		return true
+	}
+	e.pending = r
+	e.hasPend = true
 	return false
+}
+
+// endLine is called at the end of a source line while the expression is
+// still open: it ends any line comment and evaluates the pending string
+// segment of the top frame, so finds stay attributed to this line.
+func (e *exprScanner) endLine() {
+	e.comment = false
+	e.lex.endLine()
 }
 
 // scanTemplateFragment scans template-zone text until the end of the line
@@ -168,18 +182,13 @@ func (e *exprScanner) step(r rune, latin bool) (done bool) {
 func (st *svelteState) scanTemplateFragment(line string, latin bool) (string, bool) {
 	runes := []rune(line)
 	found := false
-	// textBuf accumulates text-node characters for the latin heuristic.
-	var textBuf []rune
+	textBuf := make([]rune, 0, 64)
 	flushText := func() {
 		if latin && hasASCIILetters(string(textBuf), 2) {
 			found = true
 		}
 		textBuf = textBuf[:0]
 	}
-	// expr is the active {...} expression (text level or inside a tag);
-	// expressions are line-local by design.
-	var expr *exprScanner
-
 	flushAttr := func() {
 		val := string(st.attrVal)
 		if HasDetectRunes(val) {
@@ -212,13 +221,14 @@ func (st *svelteState) scanTemplateFragment(line string, latin bool) (string, bo
 
 		// An active {...} expression swallows everything up to its
 		// closing brace — including '=>' arrows and quotes that would
-		// otherwise look like tag syntax.
-		if expr != nil {
-			if expr.step(r, latin) {
-				if expr.found {
+		// otherwise look like tag syntax. It lives in st so it can span
+		// lines.
+		if st.expr != nil {
+			if st.expr.step(r) {
+				if st.expr.lex.found {
 					found = true
 				}
-				expr = nil
+				st.expr = nil
 			}
 			i++
 			continue
@@ -238,7 +248,7 @@ func (st *svelteState) scanTemplateFragment(line string, latin bool) (string, bo
 					}
 				}
 			case r == '{':
-				expr = &exprScanner{depth: 1}
+				st.expr = newExprScanner(latin)
 			case r == '>':
 				st.inTag = false
 				st.nameBuf = st.nameBuf[:0]
@@ -286,7 +296,7 @@ func (st *svelteState) scanTemplateFragment(line string, latin bool) (string, bo
 			}
 		case r == '{':
 			flushText()
-			expr = &exprScanner{depth: 1}
+			st.expr = newExprScanner(latin)
 			i++
 		default:
 			textBuf = append(textBuf, r)
@@ -296,8 +306,15 @@ func (st *svelteState) scanTemplateFragment(line string, latin bool) (string, bo
 			i++
 		}
 	}
-	if expr != nil && expr.found {
-		found = true
+	// An expression left open at end of line continues on the next one;
+	// collect what it found on THIS line so keys stay attributed to the
+	// line containing the text.
+	if st.expr != nil {
+		st.expr.endLine()
+		if st.expr.lex.found {
+			found = true
+			st.expr.lex.found = false
+		}
 	}
 	flushText()
 	return "", found

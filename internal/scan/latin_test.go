@@ -84,6 +84,16 @@ func TestTSLatinUnionType(t *testing.T) {
 	}
 }
 
+func TestTSLatinTemplateInterpolationIsCode(t *testing.T) {
+	root := t.TempDir()
+	// ${...} contents are code, not text: identifiers inside an
+	// interpolation must not count as sentence words.
+	writeFile(t, root, "src/a.ts", "const s = `${formatSpeed(c.downlink)} (${formatBytes(c.downlinkTotal)})`;\nconst d = `${node.delay} ms`;\n")
+	if keys := scanDir(t, root, nil, []string{"src"}, nil, []string{"src"}); len(keys) != 0 {
+		t.Fatalf("interpolation code must not flag, got %v", keys)
+	}
+}
+
 func TestTSLatinTemplateLiteral(t *testing.T) {
 	root := t.TempDir()
 	writeFile(t, root, "src/a.ts", "const msg = `Update available for ${name}`;\n")
